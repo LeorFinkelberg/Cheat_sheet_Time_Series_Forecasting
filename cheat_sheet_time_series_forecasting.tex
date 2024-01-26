@@ -917,6 +917,387 @@ future_ts = train_ts.make_future(HORIZON)
 forecast_ts = model.forecast(future_ts)
 \end{lstlisting}
 
+Перекрестная проверка расширяющимся окном
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+from etna.pipeline import Pipeline
+
+model = ProphetModel()
+
+transform = []
+
+pipeline = Pipeline(
+    model=model,
+    transform=transfrom,
+    horizon=HORIZON,
+)
+\end{lstlisting}
+
+Запустить \emph{перекрестную проверку} можно с помощью метода \verb|.backtest()| класса \verb|Pipeline| \cite[\strbook{289}]{gruzdev:time-series-2022}. Передаем в метод набор данных и указываем следующие параметры:
+\begin{itemize}
+	\item \verb|metrics| -- список метрик,
+	
+	\item \verb|n_folds| -- количество тестовых выборок перекрестной проверки (по умолчанию 5),
+	
+	\item \verb|mode| -- режим перекрестной проверки (по умолчанию \verb|"expand"|, можно задать \verb|"expand"| -- перекрестную проверку \emph{расширяющимся окном} или \verb|"constant"| -- перекрестная проверка \emph{скользящим окном}),
+	
+	\item \verb|aggregate_metrics| -- агрегирование метрик по тестовым выборкам перекрестной проверки,
+	
+	\item \verb|n_jobs| -- количество ядер процессора для расспараллеливания.
+\end{itemize}
+
+Метод \verb|.backtest()| возвращает три датафрейма -- датафрейм с метриками по каждой тестовой выборке перекрестной проверки, датафрейм с прогнозами, датафрейм с временными метками обучающей и тестовой выборок перекрестной проверки.
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+metrics_df, forecast_df, fold_info_df = pipeline.backtest(
+    model="expand",
+    ts=ts, 
+    metrics=[smape],
+)
+\end{lstlisting}
+
+Класс \verb|MeanTransform| позволяет создать скользящее среднее. Ширину окна обычно берут не меньше горизонта прогнозировани, $w \geqslant \text{horizon}$.
+
+Как правило для градиентного бустинга лучше всего работают скользящие средние, скользящие стандартные отклонения, скользящие средние / медианные абсолютные отклонения \cite[\strbook{301}]{gruzdev:time-series-2022}.
+
+Класс \verb|LagTransform| позволяет создать лаги. Лаги вида $L_{t -k}$ создаем так, чтобы $k$ был не меньше горизонта прогнозирования, $n_{lags} \geqslant \text{horizon}$.
+
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+from etna.transformers import MeanTransform, LagTransform
+
+mean8 = MeanTransform(
+    in_column="target",
+    window=8,
+    out_column="mean_08",
+)
+
+lags = LagTransform(
+    in_column="target",
+    lags=range(6, 10),
+    out_column="lag",
+)
+
+# добавляем новые признаки в выборку
+train_ts.fit_transform([mean8, lags])
+# формируем набор, для которого нужно получить прогнозы
+future_ts = train_ts.make_future(HORIZON, [mean8, lags])
+\end{lstlisting}
+
+Новый способ дает для скользящего среднего с шириной окна, равной горизонту прогнозирования, пропуск в последнем значении валидационной выборки, который заменяется нулем. Лаги, у которых порядок меньше горизонта, в валидационной выборке получают пропуски.
+
+Как только наше скользящее среднее выходит за пределы обучающей выборки, происходит уменьшение ширины окна. При вычислении скользящих средних для тестовой выборки обоими способами мы \emph{мы ни разу не использовали} значения продаж в тестовой выборке.
+
+\subsection{Настройка гиперпараметров модели на валидационной выборке}
+
+Можно воспользоваться классом \verb|Pipeline|
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+train_ts, valid_ts = ts.train_test_split(
+    train_start="...",
+    train_end="...",
+    test_start="...",
+    test_end="...",
+)
+
+lags = LagTransfrom(
+    in_column="target",
+    lags=range(8, 13),
+    out_column="lag",
+)
+
+pipeline = Pipeline(
+    model=model,
+    transforms=[lags, mean8],
+    horizon=HORIZON,
+)
+
+pipeline.fit_transform(train_ts)
+forecast_ts = pipeline.forecast()
+\end{lstlisting}
+
+\subsection{Настройка гиперпараметров модели с помощью перекрестной проверки (с конструированием признаков)}
+
+С целью получения \emph{более надежных оценок} при подборе гиперпараметров выполним перекрестную проверку модели (воспользуемся перекрестной проверкой расширяющимся окном).
+
+Давайте выделим обучающую и тестовую выборки с учетом временной структуры. Тестовая выборка содержит последние 8 дней исходного набора. Сама \emph{перекрестная проверка} запускается на \emph{обучающей выборке}. Обратите внимание, что применение перекрестной проверки \emph{не отменяет откладывание тестовой выборки}. Проверочные выборки перекрестной проверки используются для настройки гиперпараметров, а тестовая выборка, -- для итоговой оценки модели. Признаки создаются, а преобразования применяются заново на каждой итерации перекрестной проверки \cite[\strbook{313}]{gruzdev:time-series-2022}.
+
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+transforms = [lags, mean8]
+
+pipeline = Pipeline(
+    model=model,
+    transforms=transforms,
+    horizon=HORIZON,
+)
+
+train_ts, test_ts = ts.train_test_split(
+    train_start="1980-01-01",
+    train_end="1993-12-01",
+    test_start="1994-01-01",
+    test_end="1994-08-01",
+)
+
+# Перекрестная проверка расширяющимся окном
+metrics_df, forecast_df, fold_info_df = pipeline.backtest(
+    mode="expand",
+    ts=train_ts,
+    metrics=[smape],
+)
+
+# Среднее значение и стандартное отклонение SMAPE (по фолдам перекрестной проверки)
+print(metrics_df["SMAPE"].mean())
+print(metrics_df["SMAPE"].std())
+\end{lstlisting}
+
+Ниже приведен пример написания и использования собственной функции для настройки гиперпараметров -- набора преобразований / признаков с помощью перекрестной проверки. Функция \verb|etna_cv_optimize()| находит набор переобразований / признаков, дающий наилучшее значение метрики по итогам перекрестной проверки, запущенной на обучающей выборке, и затем обучает конвейер с наилучшим набором на всей обучающей выборке и вычисляет метрику качества на тестовой выборке \cite[\strbook{315}]{gruzdev:time-series-2022}.
+
+\begin{lstlisting}[
+style = ironpython,
+numbers = none	
+]
+def etna_cv_optimize(ts, model, horizon, transforms, n_folds, mode, metrics, refit=True, n_train_samples=10
+):
+    train_ts, test_ts = ts.train_test_split(test_size=horizon)
+    best_score = np.inf
+    
+    for trans in transfrms:
+        pipe = Pipeline(
+            model=model,
+            transforms=trans,
+            horizon=horizon,
+        )
+        
+        df_metrics, _, _ = pipe.backtest(
+            mode=mode,
+            n_folds=n_folds,
+            ts=train_ts,
+            metrics=[metrics],
+            aggregate_metrics=False,
+            joblib_params=dict(verbose=0)
+        )
+        
+        # вычисляем значение метрики, усредненное по тестовым выборкам
+        metrics_mean = df_metrics[metrics.__class__.__name__].mean()
+        
+        # вычисляем стандартное отклонение метрики
+        metrics_std = df_metrics[metrics.__class__.__name__].std()
+        
+        if metrics_mean < best_score:
+            best_score = metrics_mean
+            best_params = {"trans": trans}
+   
+   if refit:
+       pipe = Pipeline(
+           model=model,
+           transforms=best_params.get("trans"), 
+           horizon=horizon,
+       )
+       
+       # обучаем конвейер на всей обучающей выборке
+       pipe.fit(train_ts)
+       forecast_ts = pipe.forecast()
+       print(metrics(y_true=test_ts, y_pred=forecast_ts))
+       
+       plot_forecast(
+           forecast_ts,
+           test_ts,
+           train_ts,
+           n_train_samples=n_train_samples,
+       )
+\end{lstlisting}
+
+Выполняем подбор гиперпараметров -- набора преобразований / признаков с помощью перекрестной проверки
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+model = CatboostModelMultiSegment(
+    loss_function="MAE",
+    n_estimators=600,
+    learning_rate=0.05,
+    depth=9,
+    random_seed=42,
+)
+
+etna_cv_optimize(
+    ts=ts, model=model, horizon=HORIZON, transforms=[transforms, transforms2],
+    n_folds=5, mode="expand", metrics=SMAPE(), refit=True, 
+)
+\end{lstlisting}
+
+\subsection{Перекрестная проверка нескольких моделей}
+
+В ряде случаев бывает полезно сравнить несколько базовых моделей, не предполагая настройки гиперпараметров. Например, мы много сил вкладываем в модель CatBoost, но вполне возможно, что более простая модель даст лучшее качество прогнозов (ситуация, встречающаяся в прогнозировании рядов сплошь и рядом).
+
+\subsection{Ансамбли}
+
+С помощью класса \verb|VotingEnsemble| можно выполнить обучение и перекрестную проверку ансамбля моделей. Веса моделей можно задавать с помощью параметра \verb|weights|
+
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+from etna.ensemble import VotingEnsemble
+
+pipes = [prophet_pipeline, sma_seasonality_12_pipeline]
+vot_ens = VotingEnsemble(
+    pipelines=pipes,
+    weights=[0.5, 9],
+    n_jobs=2,
+)
+\end{lstlisting}
+
+Для получения более надженой оценки качества применим перекрестную проверку
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+vot_ens_metrics, vot_ens_forecasts, _ = vot_ens.backtest(
+    ts=ts,
+    metrics=[MAE(), MSE(), SMAPE(), MAPE()],
+    n_folds=3,
+    aggregate_metrics=True,
+    n_jobs=2,
+)
+\end{lstlisting}
+
+\subsection{Стекинг}
+
+С помощью класса \verb|StackingEnsemble| можно выполнить стекинг. По умолчанию \verb|features_to_use=None| и метамодель может использовать в качестве признаков прогнозы моделей первого уровня (моделей конвейеров). С помощью параметра \verb|n_folds| задаем каличество тестовых выборок перекрестной проверки (используем не для оценки моделей, а для получения прогнозов, которые станут у нас потом признаками) \cite[\strbook{339}]{gruzdev:time-series-2022}.
+
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+stacking_ensemble_unfeatured = StackingEnsemble(
+    features_to_use=None,
+    pipelines=pipelines,
+    n_folds=10,
+    n_jobs=4,
+)
+
+stacking_ensamble_metrics = stacking_ensemble_unfeatured.backtest(
+    ts=ts, metrics=[MAE(), MSE(), SMAPE(), MAPE()], n_folds=3, aggregate_metrics=True, n_jobs=2
+)[0].iloc[:, 1:]
+stacking_ensamble_metrics.index = ["stacking ensamble"]
+\end{lstlisting}
+ 
+\subsection{Работа с трендом и сезонностью}
+
+Исследователям, применяющим градиентный бустинг для прогнозирования временных рядов, следует помнить, что одним из недостатков деревьев и их потомков -- случайного леса и градиентного бустинга -- можно считать {\color{red}принципиальную неспособность деревьев выполнять \emph{экстраполяцию} при решении задачи регрессии}: предсказание для любой комбинации предикторов \emph{всегда будет средним значением в одном из листьев}, то есть \emph{за пределы диапазона значений зависимой переменной в обучающей выборке выйти невозможно}. При работе с временными рядами, содержащими тренд, получится, что на \emph{тестовой} выборке мы выйдем из диапазона значений, известных модели дерева на обучающей выборке, и модель дерева просто будет продолжать \emph{предсказывать последнюю известную точку} (прогнозы будут представлять собой горизонтальную линию). В этом случае можно воспользоваться процедурой удаления тренда с последующим восстановлением \cite[\strbook{368}]{gruzdev:time-series-2022}.
+
+Процедура состоит из следующих шагов:
+\begin{enumerate}
+	\item На обучающем массиве признаков, в котором единственный признак -- номер периода, и обучающем массиве меток (собственно временном ряды) обучаем линейную модель (например, модель линейной регрессии). Прогнозами у нас будут значения тренда для обучающего ряда.
+	
+	\item Если у нас \emph{сезнность} является \emph{мультипликативной}, то значения обучающего массива меток \emph{делим на значения тренда} для обучающей выборки и получаем обучающий массив меток без тренда. Если у нас \emph{сезонность} является \emph{аддитивной}, то из значений обучающего массива меток \emph{вычитаем значения тренда} для обучающего ряда и получаем обучающий массив меток без тренда.
+	
+	\item Вычисляем значения тренда для тестового ряда. Обратите внимание, что здесь мы нигде не используем значения тестового ряда, мы помним, что тестовый ряд -- это прообраз новых данных, о котором мы ничего не знаем.
+	
+	\item На обучающем массиве признаков и обучающем массиве меток \underline{без тренда} обучаем модель градиентного бустинга. Затем получаем прогнозы для \emph{тестового} массива признаков.
+	
+	\item Наконец, выполняем восстановление тренда. Если у нас была аддитивная сезонность, мы к прогнозам градиентного бустинга для тестового ряда прибавляем значения тренда для тестового ряда (потому что ранее вычитали тренд). Если у нас была мультипликативная сезонность, мы умножаем прогнозы градиентного бустинга для тестового ряда на значения тренда для тестового ряда (потому что ранее делили на тренд).
+\end{enumerate}
+
+Данную процедуру можно выполнить с помощью классов \verb|LinearTrendTransform|, \verb|ChangePointsTrendTransform| (используется класс \verb|Binseg| библиотеки ruptures) и \verb|TheilSenTrendTransform|\footnote{Используется класс \texttt{TheilSenRegressor} библиотеки scikit-learn} (вычисляет линейный тренд с помощью линейной регрессии, в которой выбирается медиана наклонов всех прямых, проходящих через пары точек выборки на плоскости, этот подход называется методом оценочной функции Тейла-Сена).
+
+Часто процедуру детерендинга сочетают с процедурой логарифмирования: сначала выполняют логарифмирование, а затем детрендинг. Логарифмирование позволяет стабилизировать дисперсию временного ряда, особенно это актуально, когда дисперсия возрастает со временем и это может ухудшить прогноз как линейной модели, так и модели на основе деревьев решений. Если выполняется логарифмирование, то прогнозы с восстановленным трендом необходимо экспоненцировать.
+
+Библиотека ETNA предлагает инструменты для моделирования сезонности. Сезонная компонента -- регулярные изменения уровня ряда с постоянным периодом. Этим периодом может быть час, день, неделя, месяц. кваратал, год. Сезонность может быть \emph{аддитивной} (амплитуда сезонных колебаний остается неизменной) и \emph{мультипликативной} (амплитуда сезонных колебаний варьирует). Сезонность всегда фиксирована и известна.
+
+С помощью класса \verb|FourierTransform| подбираем порядок (параметр \verb|order|), по сути количество компонентов (членов) ряда Фурье с периодом, соответствующим обнаруженной годовой сезонности, то есть с периодом 365.24 (параметр \verb|period|).
+
+Признаки времени в рамках 24-часового суточного цикла можно создать с помощью параметров класса \verb|TimeFlagsTransform|. Признаки дат в рамках годового цикла можно создать с помощью параметров \verb|DateFlagsTransform|.
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+train_raif_ts, valid_raif_ts = raif_ts.train_test_split(
+    train_start="2008-01-02",
+    train_end="2015-07-04",
+    test_start="2015-07-05",
+    test_end="2015-10-02",
+)
+
+# для логарифмирования зависимой переменной
+log = LogTransform(in_column="target")
+
+# для детрендинга
+detrend = LinearTrendTransform(in_column="target")
+
+# порядок лага должен быть неменьше горизонта прогнозирования
+lags = LagTransform(
+    in_column="target",
+    lags=list(range(90, 271, 30)),
+    out_column="lag",
+)
+
+# скользящие средние
+mean90 = MeanTransform(
+    in_column="target",
+    window=90,
+    out_column="mean90",
+)
+
+mean150 = MeanTransform(
+    in_column="target",
+    window=150,
+    out_column="mean150",
+)
+
+mean210 = MeanTransform(
+    in_column="target",
+    window=210,
+    out_column="mean210",
+)
+
+# признаки на основе дат
+d_flags = DateFlagsTransform(
+    day_number_in_week=True,
+    day_number_in_week=True,
+    month_number_in_year=True,
+    out_column="datetime",
+)
+
+# признаки для праздников
+holidays = HolidayTransform(
+    iso_code="RUS",
+    out_column="RUS_holidays",
+)
+
+fourier_year = FourierTransform(
+    period=365.24,
+    order=3,
+    out_column="fourier_year",
+)
+
+# список преобразований/признаков
+trans = [log, detrend, lags, mean90, mean150, mean210, d_flags, holidays, fourier_year]
+
+train_raif_ts.fit_transform(trans)
+
+model = CatBoostMultiSegmentModel()
+model.fit(train_raif_ts)
+
+future_ts = train_raif_ts.make_future(raif_HORIZON, trans)
+forecast_ts = model.forecast(future_ts)
+forecast_ts.inverse_transform(trans)
+smape(y_true=valid_raif_ts, y_pred=forecast_ts)
+\end{lstlisting}
+
+
 
 
 
