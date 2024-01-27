@@ -1297,9 +1297,330 @@ forecast_ts.inverse_transform(trans)
 smape(y_true=valid_raif_ts, y_pred=forecast_ts)
 \end{lstlisting}
 
+\subsection{Обработка выбросов}
+
+С помощью функций \verb|get_anomalies_median()|, \verb|get_anomalies_density()| и \verb|get_anomalies_hist()| мы можем попробовать разные способы обработки выбросов. Они используются только для разведочного анализа.
+
+Согласно медианного способа выбросы -- это все точки, отклоняющиеся от медианы более чем на \verb|alpha * std|, то есть $median \pm \alpha \cdot \sigma$. Параметры:
+\begin{itemize}
+	\item $\alpha$ (\verb|alpha|) -- порог (по умолчанию 3),
+	
+	\item $\sigma$ (\verb|sigma|) -- выборочная \underline{дисперсия} в окне размером \verb|window_size|,
+	
+	\item \verb|window_size| -- размер окна или количество наблюдений (по умолчанию 10).
+\end{itemize}
+
+Согласно способу обнаружения выбросов на основе плотности для каждой точки ряда мы строим все окна размера \verb|window_size|, содержащие эту точку, и если какое-либо окно из окон содержит по крайней мере \verb|n_neighbors|, которые находятся ближе, чем \verb|distance_coef * std(series)|, до интересующей точки в соответствии с \verb|distance_func|, то интересующая нас точка не является выбросом:
+\begin{itemize}
+	\item \verb|window_size| -- размер окна (по умолчанию 15),
+	
+	\item \verb|n_neighbors| -- минимальное количество соседей точки, необходимое для того, чтобы точка не была объявлена выбросом (по умолчанию 3),
+	
+	\item \verb|distance_coef| -- множитель для \underline{стандартного отклонения}, который формирует пороговое значение расстояния, при котором мы считаем точки близко расположенными друг к другу (по умолчанию 3),
+	
+	\item \verb|distance_func| -- функция расстояния, которой по умолчанию является абсолютная разница между двумя значениями.
+\end{itemize}
+
+Согласно способу обнаружения выбросов на основе гистограммы выбросы -- это точки, удаление которых приводти \emph{к гистограмме с меньшей ошибкой аппроксимации}, даже если количество бинов меньше, чем количество выбросов.
+
+В библиотеке ETNA процесс обработки выбросов состоит из двух этапов:
+\begin{itemize}
+	\item Заменяемы выбросы, обнаруженные с помощью определенного метода, на значения NaN, используя экземпляр соответствующего класса \verb|OutliersTransform|,
+	
+	\item Импутируем значения NaN с помощью класса \verb|TimeSeriesImputerTransform|.
+\end{itemize}
+
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+best_params = {
+    "window_size": 60,
+    "alpha": 2.35,
+}
+
+outliers_remover = MedianOutliersTransform(
+    in_column="target",
+    **best_params,
+)
+
+outliers_imputer = TimeSeriesImputerTransform(
+    in_column="target",
+    strategy="running_mean",
+    window=30,
+)
+outlier_ts.fit_transform([
+    outliers_remover,  # заменяем выбросы на NaN
+    outliers_imputer,  # импутируем пропуски
+])
+\end{lstlisting}
+
+Воспользуемся моделью CatBoost с помощью класса \verb|CatBoostModelMultiSegment|. Перед построением модели выполним некоторые преобразования и создадим новые признаки для наших рядов. 
+
+Нам понадобятся следующие классы-трансформеры:
+\begin{itemize}
+	\item класс \verb|MedianOutliersTransform| для замены выбросов, обнаруженных в соответствии с медианным методом, на значения NaN,
+	
+	\item класс \verb|TimeSeriesImputerTransform| для импутации значений NaN в соответствии с выбранной стратегией,
+	
+	\item класс \verb|LogTransform| для логарифмирования и экспоненцирования переменной (логарифмирование позволяет сгладить негативное влияние выбросов объективной природы, помогает выделить тренд),
+	
+	\item класс \verb|LinearTrendTransform| для:
+	\begin{itemize}
+		\item \emph{прогнозирования} тренда,
+		
+		\item \emph{удаления} тренда из данных и
+		
+	   \item \emph{\underline{добавления}} тренда к прогнозам (это необходимо для деревьев решений и для ансамбля деревьев решений, \emph{\color{red}не умеющих экстраполировать})
+    \end{itemize}
+    
+    \item класс \verb|TrendTransform| для добавления тренда в качестве признака,
+    
+    \item класс \verb|SegmentEncoderTransform| для кодирования меток сегментов целочисленными значениями в лексиграфическом порядке (LabelEncoding),
+    
+    \item класс \verb|LagTransform| для генерации лагов,
+    
+    \item класс \verb|DateFlagsTransform| для генерации признаков на основе дат -- порядковый дня недели, порядковый номер дня месяца, порядковый номер месяца в году,
+    
+    \item класс \verb|HolidayTransform| для генерации праздников на основе дат,
+    
+    \item класс \verb|MeanTransform| для вычисления скользящего среднего по заданному окну,
+    
+    \item класс \verb|FourierTransform| для генерации компонент ряда Фурье.
+\end{itemize}
+
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+mult_outliers_remover = MedianOutliersTransform(
+    in_column="target",
+    window_size=150,
+    alpha=15
+)
+mult_outliers_imputer = TimeSeriesImputerTransform(
+    in_column="target",
+    strategy="forward_fill",
+)
+mult_log = LogTransform(in_column="target")
+mult_linear_trend = LinearTrendTransform(in_column="target")
+mult_trend_feat = TrendTransform(
+    in_column = "target",
+    change_points_model=RupturesChangePointsModel(
+        change_points_model=Binseg(model="ar"),
+        n_bkps=5,
+    ),
+    out_column="trend_feat",
+)
+mult_seg = SegmentEncoderTransform()
+mult_lags = LagTransfrom(
+    in_column="target",
+    lags=list(range(7, 211, 7)),
+    out_column="lag",
+)
+mult_mean_7 = MeanTransform(
+    in_column="target",
+    window=7,
+    out_column="mean7",
+)
+mult_mean14 = MeanTransform(
+    in_column="target",
+    window=14,
+    out_column="mean14",
+)
+mult_mean30 = MeanTransform(
+    in_column="target",
+    window=30,
+    out_column="mean30",
+)
+mult_d_flags = DateFlagsTransform(
+    day_number_in_week=True,
+    day_number_in_month=True,
+    is_weekend_in_year=True,
+    is_weekend=True,
+    out_column="datetime",
+)
+mult_d_flags2 = DateFlagsTransform(
+    is_weekend=True,
+    out_column="datetime2",
+)
+mult_holidays = HolidayTransform(
+    iso_code="RUS",
+    out_column="RUS_holidays",
+)
+# для моделирования годовой сезонности
+mult_fourier_year = FourierTransform(
+    period=365.24,
+    order=3,
+    out_column="fourier_year",
+)
+# для моделирования недельной сезонности
+mult_fourier_week = FourierTransform(
+    period=7,
+    order=2,
+    out_column="fourier_week",
+)
+
+mult_ctsbst_preprocess = [
+    mult_outliers_remover,
+    mult_outliers_imputer,
+    mult_log,
+    mult_linear_trend,
+    mult_trend_feat,
+    mult_seg,
+    mult_lags,
+    mult_mean7,
+    mult_mean14,
+    mult_mean30,
+    mult_d_flags,
+    mult_d_flags2,
+    mult_holidays,
+    mult_fourier_year,
+    mult_fourier_week,
+]
+
+ctbst_model = CatBoostMultiSegemntModel()
+
+# выполняем подбор гиперпараметра -- набора преобразований/признаков с помощью перекрестной проверки модели CatBoost
+etna_cv_optimize(
+    ts=mult_ts,
+    model=ctbst_model,
+    horizon=mult_HORIZON,
+    transforms=[
+        mult_ctbst_preprocess,
+        mult_ctbst_preprocess2,  # без детрендинга и добавления тренда в качестве фичи
+    ],
+    n_folds=12,
+    mode="expand",
+    metrics=SMAPE(),
+    refit=True,
+)
+\end{lstlisting}
+
+Конвейер можно дополнить этапом стандартизации \emph{всех признаков}
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+standardscaler = StandardScalerTransform(in_column=None)
+\end{lstlisting}
+
+\subsection{Оптимизация гиперпараметров с помощью Optuna}
+
+Пишем функцию инициализации логгера
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+def init_logger(
+    config: dict,
+    project: str = "wandb-sweeps",
+    tags: t.Optional[t.List[str]] = ["test", "sweeps"]
+):
+    tsloggerloggers = []
+    wblogger = WandbLogger(
+        project=project,
+        tags=tags,
+        config=config,
+    )
+    
+    tslogger.add(wblogger)
+\end{lstlisting}
+
+Пишем функцию, загружающую данные
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+def dataloader(
+    file_path: Path, 
+    freq: str = "D",
+) -> TSDataset:
+    df = pd.read_csv(file_path)
+    df = TSDataset.to_dataset(df)
+    ts = TSDataset(df, freq)
+    return ts
+\end{lstlisting}
+
+Теперь пишем целевую функцию Optuna
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+def objective(
+    trial: optuna.Trial,
+    metric_name: str,
+    ts: TSDataset,
+    horizon: str,
+    lags: int,
+    seed: int,
+):
+    set_seed(seed)
+    
+    pipeline = Pipeline(
+        # подбираем гиперпараметры модели
+        model=CatBoostMultiSegmentModel(
+            iterations=trial.suggest_int("iterations", 10, 100),
+            depth=trail.suggest_int("depth", 1, 12),
+        ),
+        # и подбираем пространство признаков
+        transforms=[
+            StandardScalerTransform("target"),
+            SegmentEncoderTransform(),
+            LagTransform(
+                in_column="target",
+                lags=list(range(horizon, horizon + trial.suggest_int("lags", 1, lags)))
+            )
+        ],
+        horizon=horizon,
+    )
+    
+	init_logger(pipeline.to_dict())
+	
+	metrics, _, _ = pipeline.backtest(  # CV
+	    ts=ts, metrics=[MAE(), SMAPE(), Sign(), MSE()]
+	)
+	
+	return metrics[metric_name].mean()
+\end{lstlisting}
+
+Создаем приложение для запуска
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
 
 
-
+@app.command()
+def run_optuna(
+    horizon: int = 14,
+    metric_name: str = "MAE",
+    storage: str = "sqlite:///optuna.db",
+    study_name: t.Optional[str] = None,
+    n_trials: int = 5,
+    file_path: Path = "Data/example_dataset.csv",
+    direction: str = "minimize",
+    freq: str = "D",
+    lags: int = 24,
+    seed: int = 11,
+):
+    ts = dataloader(file_path, freq=freq)
+    study = optuna.create_study(
+        storage=storage,
+        study_name=study_name,
+        sampler=optuna.samplers.TPESampler(multivariate=True, group=True),
+        load_if_exists=True,
+        direction=direction,
+    )
+    
+    study.optimize(
+        parital(objective, metric_name, ts, horizon, lags, seed),  # NB!
+        n_trials,
+    )
+    
+if __name__ == "__main__":
+    typer.run_optuna)
+\end{lstlisting}
 
 
 
