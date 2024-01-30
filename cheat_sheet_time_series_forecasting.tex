@@ -1622,6 +1622,518 @@ if __name__ == "__main__":
     typer.run_optuna)
 \end{lstlisting}
 
+\section{Задача Райффайезн Банк}
+
+Будем логарифмировать и стандартизировать зависимую переменную, из нее будем вычитать тренд, делать LabelEncoding для кодирования меток сегментов, создавать календарные признаки (порядковый номер дня в году/неделе/месяце, порядковый номер недели в месяце/году, порядковый номер месяца в году, порядковый номер сезона, индикатор выходного дня), формировать лаги, скользящие средние и скользящие разности между максимальным и минимальным значениями на основе прологарифмированной зависимой переменной с удаленным трендом.
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+# для логарифмирования зависимой переменной
+log = LogTransform(in_column="target")
+
+# для стандартизации зависимой переменной
+scaler = StandardScalerTransform(in_column="target")
+
+# для прогнозирования тренда, удаления тренда из данных и добавления тренда к прогнозам
+detrend = LinearTrendTransform(in_column="target")
+
+# для кодирования меток сегментов целочисленными значениями в лексикографическом порядке
+seg = SegmentEncoderTransform()
+
+# для генерации лагов
+lags = LagTransform(
+    in_column="target",
+    lags=list(range(90, 361, 30)),
+    out_column="lag",
+)
+
+# для генерации признаков на основе дат
+d_flags = DateFlagsTransform(
+    day_number_in_year=True,
+    day_number_in_week=True,
+    week_number_in_month=True,
+    week_number_in_year=True,
+    month_number_in_year=True,
+    season_number=True,
+    is_weekend=True,
+    out_column="datetime",
+)
+
+# для вычисления среднего по заданному окну
+mean90 = MeanTransform(
+    in_column="target",
+    window=90,
+    out_column="mean90",
+)
+
+mean180 = MeanTransform(
+    in_column="target",
+    window=180,
+    out_column="mean180",
+)
+
+mean270 = MeanTransform(
+    in_column="target",
+    window=270,
+    out_column="mean270",
+)
+
+# для вычисления разности по заданному окну
+minmax270 = MinMaxDifferenceTransform(
+    in_column="target",
+    window=270,
+    out_column="minmax270",
+)
+\end{lstlisting}
+
+Для большей надежности оценим качество модели с помощью перекрестной проверки
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+ctbst_model = CatBoostMultiSegmentModel(
+    iterations=500,
+    learning_rate=0.25,
+    depth=5,
+)
+
+preprocess = [log, scaler, detrend, seg, lags, d_flags, mean90, mean180, mean270, minmax270]
+
+pipe = Pipeline(
+    model=ctbst_model,
+    transforms=preprocess,
+    horzon=HORIZON,
+)
+
+metrics_df, forecast_df, fold_info_df = pipe.backtest(
+    mode="expand",
+    n_folds=4,
+    ts=ts,
+    metrics=[smape],
+    aggregate_metrics=True,
+    joblib_params=dict(backend="loky")
+)
+
+# среднее значение по сегментам
+mean_smape = metrics_df["SMAPE"].mean()
+\end{lstlisting}
+
+Если качество модели устраивает, обучаем на всем историческом наборе \cite[\strbook{429}]{gruzdev:time-series-2022}.
+
+\subsection{Оптимизация гиперпараметров модели с выделением отдельной тестовой выборки}
+
+Выполним оптимизацию гиперпараметров с выделением отдельной тестовой выборки, на которой будем тестировать модель с найденными наилучшими гиперпараметрами.
+
+Пишем целевую функцию Optuna. Мы будем настраиваеть верхнюю границу порядка лага, шаг изменения порядка лага и ширину окна для скользящего среднего. Таким образом, настраиваем \emph{не только гиперпараметры модели} машинного обучения, но и \emph{гиперпараметры}, \emph{отвечающие за конструирование признаков}. Для оценки качества модели используется перекрестная проверка расширяющимся / скользящим окном
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+def objective(trial, ts, horizon, metrics, metric_name, n_folds, depth, lag_upper_bound, lag_step, window_size, print_configurations, print_metrics, seed):
+    set_seed(seed)
+    
+    # для логарифмирования зависимой переменной
+    log = LogTransform(in_column="target")
+    
+    # для стандартизации зависимой переменной
+    scaler = StandardScalerTransform("target")
+    
+    # для прогнозирования тренда, удаления тренда из данных и добавления тренда к прогнозам
+    detrend = LinearTrendTransform(in_column="target")
+    
+    # для кодирования меток сегментов целочисленными значениями
+    seg = SegmentEncoderTransform()
+    
+    # для генерации лагов
+    lag = LagTransform(
+        in_column="target",
+        lags=list(
+            range(
+                horizon,
+                trial.suggest_int("lag_upper_bound", 100, lag_upper_bound),
+                trail.suggest_int("lag_step", 5, lag_step)
+            )
+        )
+    )
+    
+    # для генерации скользящих средних
+    mean = MeanTransform(
+        in_column="target",
+        window=trail.suggest_int("window_size", horizon, window_size)
+    )
+    
+    # для генерации признаков на основе дат
+    d_flags = DateFlagsTransform(
+        day_number_int_week=True,
+        day_number_int_month=True,
+        month_number_in_year=True,
+        season_number=True,
+        is_weekend=True,
+        out_column="datetime",
+    )
+    
+    transforms = [log, scaler, detrend, seg, lag, mean, d_flags]
+    
+    pipeline = Pipeline(
+        model = CatBoostMultiSegmentModel(
+            iterations=500,
+            depth=trial.suggest_int("depth", 3, depth)
+        ),
+        transforms=transforms,
+        horizon=horizon,
+    )
+    
+    df_metrics, _, _ = pipeline.backtest(ts=ts, metrics=[metrics], n_folds=n_folds, aggregate_metrics=True)
+    
+    return df_metrics[metric_name].mean()
+\end{lstlisting}
+
+Пишем функцию, создающую обучающую и тестовую наборы. На вход она принимает исторический набор эндогенных переменных и исторический набор экзогенных переменных. \emph{Эндогенные} переменные -- это собственно прогнозируемые временные ряды, а \emph{экзогенные} переменные -- любые дополнителные данные, которые помогают нам прогнозировать интересующие нас ряды.
+
+Здесь под эндогенными переменными подразумеваются данные продаж, а под экзогенными переменными -- данные рекламной активности. Кроме того, помним, что набор \emph{экзогенных} переменных в формате ETNA \emph{охватывает историческую часть и прогнозируемый период} \cite[\strbook{435}]{gruzdev:time-series-2022}.
+
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+def train_test_dataloader(
+    internal_hist_path,
+    external_hist_pah,
+    horizon=90,
+    freq="D",
+    verbose=False,
+):
+    hist_sales = pd.read_csv(
+        internal_hist_path,
+        index_col=["date"],
+        parse_dates=["date"],
+    )
+    
+    hist_advert = pd.read_csv(
+        external_hist_path,
+        parse_dates=["date"],
+    )
+    
+    hist_sales.interpolate(method="linear")
+    
+    train_sales = hist_sales.iloc[:-horizon]
+    train_sales = train_sales[train_sales.index >= "2013-01-01"]
+    hist_advert = hist_advert[hist_advert["date"] >= "2013-01-01"].reset_index(drop=True)
+    
+    train_sales["timestamp"] = train_sales.index
+    train_sales = train_sales.reset_index(drop=True)
+    
+    train_sales_melt = train_sales.melt(
+        id_vars="timestamp",
+        var_name="segment",
+        value_name="target",
+    )
+    
+    train_ts_format = TSDataset.to_dataset(train_sales_melt)
+    hist_advert.rename(columns={"date": "timestamp"}, inplace=True)
+    hist_advert_melt = hist_advert.melt(
+        id_vars="timestamp",
+        var_name="segment",
+        value_name="advert",
+    )
+    
+    hist_advert_melt["quater"] = hist_advert_metl["timestamp"].dt.quater
+    hist_advert_melt["quater_start"] = hist_advert_melt["timestamp"].dt.is_quater_start
+    hist_advert_melt["quater_end"] = hist_advert_metl["timestamp"].dt.is_quater_end
+    hist_advert_melt["month_name"] = hist_advert_melt["timestamp"].dt.strftime("%b")
+    hist_advert_melt["month_name"] = hist_advert_melt["month_name"].astype("category")
+    
+    # переводим набор с экзогенными переменными (рекламная активность, календарные признаки) в формат ETNA
+    hist_regressors_ts_format = TSDataset.to_dataset(hist_advert_melt)
+    
+    # создаем итоговый обучающий набор как объект TSDataset
+    train_ts = TSDataset(
+        train_ts_format, freq=freq,
+        df_exog=hist_regressors_ts_format, known_future="all"
+    )
+    
+    # формируем тестовый набор
+    test_sales = hist_sales.iloc[-horizon:]
+    test_sales["timestamp"] = test_sales.index
+    test_sales = test_sales.reset_index(drop=True)
+    
+    test_sales_melt = test_sales.metl(
+        id_vars="timestamp",
+        var_name="segment",
+        value_name="target",
+    )
+    
+    test_ts_format = TSDataset.to_dataset(test_sales_melt)
+    test_ts = TSDataset(test_ts_format, freq=freq)
+    
+    return train_ts, test_ts
+\end{lstlisting}
+
+Можно выполнить оптимизацию гиперпараметров \emph{на всем историческом наборе \underline{без выделения} тестовой выборки}. Хотя данную схему часто используют в условиях нехватки данных для полноценного тестирования, она является менее предпочтительной стратегией проверки, поскольку настройка гиперпараметров и выбор наилучшей модели происходят с помощью одних и тех же тестовых выборок перекрестной проверки \cite[\strbook{468}]{gruzdev:time-series-2022}.
+
+Если качество модели нас устраивает, то обучаем модель с найденным значением гиперпараметра \verb|depth| \emph{на всех исторических данных}.
+
+\section{Задача Store Sales -- Time Series Forecasting}
+
+\subsection{Добавление экзогенных переменных -- регрессоров}
+
+В терминологии ETNA зависимая переменная \emph{Объем продаж} будет \emph{эндогенной} переменной, а все признаки, кроме признака даты, будут \emph{экзогенными} переменными.
+
+Экзогенные переменные, значения которых известны в будущем, называют \emph{регрессорами}.
+
+Создаем объединенный набор, указав с помощью значения \verb|"all"| параметра \verb|known_future|, что значение всех экзогенных переменных известны в будущем.
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+ts = TSDataset(
+    df=TSDataset.to_dataset(train),
+    df_exog=TSDataset.to_dataset(train_exog),
+    freq="D",
+    known_future="all",
+)
+\end{lstlisting}
+
+Теперь создаем список преобразований
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+transforms = [
+    MinMaxScaler(in_column="target"),
+    LagTransform(
+        in_column="target",
+        lags=list(range(HORIZON, HORIZON + num_lags)),
+        out_column="lag",
+    ),
+    DateFlagsTransform(
+        day_number_in_week=True,
+        day_number_in_month=True,
+        is_weekend=True,
+        out_column="datetime",
+    ),
+    MeanTransform(
+        in_column="target",
+        window=32,
+        out_column="mean32",
+    )
+]
+\end{lstlisting}
+
+В качестве модели возьмем модель градиентного бустинга LightGBM (гиперпараметры были подобраны, исходя из априорных знаний). Для более надежной оценки качества модели воспользоуемся перекрестной проверкой скользящим окном
+\begin{lstlisting}[
+style = ironpython,
+numbers = none	
+]
+model = LGBMMultiSegmentModel(
+    n_estimators=400,
+    learning_rate=0.08,
+    min_data_in_leaf=80,
+    subsample=0.6,
+)
+
+pipeline = Pipeline(
+    model=model,
+    horizon=HORIZON,
+    transforms=transforms,
+)
+
+# запускаем перекрестную проверку расширяющимся окном
+metrics_df, forecast_df, fold_info_df = pipeline.backtest(
+    ts=ts, metrics=[MSE()], n_folds=3,
+)
+\end{lstlisting}
+
+Если качество модели нас устраивает, то обучаем модель \emph{\color{blue}на всех исторических данных!!!}.
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+model = LGBMultiSegmentModel(
+    n_estimators=400,
+    learning_rate=0.08,
+    min_data_in_leaf=80,
+    subsample=0.6,
+)
+
+pipeline = Pipeline(
+    model=model,
+    horizon=HORIZON,
+    transforms=transforms,
+)
+
+# обучаем на ВСЕМ ИСТОРИЧЕСКОМ НАБОРЕ
+pipeline.fit(ts=ts)
+\end{lstlisting}
+
+\subsection{Добавление экзогенных переменных -- регрессоров и экзогенных переменных -- не регрессоров}
+
+Используем как экзогенные переменные -- регрессоры (<<идентификационный номер магазина>>, <<продуктовая группа>>), так и зкзогенную переменную -- не регрессор (переменная <<ежедневная цена не нефть>> из набора oil.csv). Экзогенная переменная <<ежедневная цена на нефть>> не является регрессором, поскольку мы не знаем, какой будет цена на нефть в будущем.
+
+Выполняем переиндексацию, потому что данные о ценах на нефть не содержат выходных дней, а наши данные о продажах включают выходные дни, неизбежно появятся пропуски, которые нужно будет импутировать. 
+
+Теперь к набору с экзогенными переменными -- регрессорами <<идентификационный номер магазина>> и <<продуктовая группа>> присоединяется набор с экзогенной переменной -- не регрессором <<ежедневная цена на нефть>>.
+
+Для прогнозируемого периода значения регрессоров известны, а у не регрессоров стоят значения NaN.
+
+Теперь на основе полученных наборов создаем объединенный набор, указав с помощью параметра \verb|known_future| экзогенные переменные, значения которых известны в будущем.
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+ts = TSDataset(
+    df=TSDataset.to_dataset(train),
+    df_exog=TSDataset.to_dataset(train_exog),
+    freq="D", known_future=["regressor_store_nbr", "regressor_family"],
+)
+\end{lstlisting}
+
+Создаем список преобразований/признаков. Список процедур включает стандартизацию зависимой переменной, создание лагов, скользящего среднего и некоторых календарных праздников. Кроме того, мы добавили импутацию пропусков в переменной dcoilwtcio, генерацию переменной dcoilwtico с лагом 1, вычисление скользящего среднего на основе этой переменной с последующим удалением исходной переменной dcoilwtico и переменной dcoilwtico, взятой с лагом 1.
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+num_lags = 50
+
+transforms = [
+    MinMaxScalerTransform(in_column="target"),
+    LagTransform(
+        in_column="target",
+        lags=list(range(HORIZON, HORIZON + num_lags)),
+        out_column="lag"
+    ),
+    DateFlagsTransform(
+        day_number_in_week=True,
+        day_number_in_month=True,
+        is_weekend=True,
+        out_column="datetime",
+    ),
+    MeanTransform(
+        in_column="target",
+        window=32,
+        out_column="mean32",
+    ),
+    TimeSeriesImputerTransform(
+        in_column="dcoilwtico",
+        strategy="forward_fill",
+        window=16,
+    ),
+    LagTransform(
+        in_column="dcoilwtico",
+        lags=[1],
+        out_column="dcoilwtico_lag",
+    ),
+    MeanTransform(
+        in_column="dcoilwtico_lag_1",
+        window=16,
+        out_column="dcoilwtico_mean16_on_lag_1",
+    ),
+    FilterFeaturesTransform(
+        exclude=["dcoilwtico", "dcoilwtico_lag_1"]
+    )
+]
+\end{lstlisting}
+
+\section{Отбор признаков}
+
+Библиотека ETNA позволяет выполнить отбор признаков.
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+select_ts = TSDataset(
+    df=df,
+    freq="D",
+    df_exog=regressor_df,
+    known_future="all",
+)
+\end{lstlisting}
+
+Создаем список преобразований/признаков без отобора прзнаков
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+scaler = StandardSalerTransform(in_column="target")
+
+lags = LagTransform(
+    in_column="target",
+    lags=list(range(90, 360, 20)),
+    out_column="lag",
+)
+
+# для моделирования годовой сезонности с периодом 365.24
+fourier_year = FourierTransform(
+    period=365.24,
+    order=3,
+    out_column="fourier_year",
+)
+
+mean90 = MeanTransform(
+    in_column="target",
+    window=90,
+    out_column="mean90",
+)
+
+mean180 = MeanTransform(
+	in_column="target",
+	window=180,
+	out_column="mean180",
+)
+
+mean270 = MeanTransform(
+	in_column="target",
+	window=270,
+	out_column="mean270",
+)
+
+mean360 = MeanTransform(
+	in_column="target",
+	window=360,
+	out_column="mean360",
+)
+
+d_flags = DateFlagsTransform(
+    day_number_in_year=True,
+    ...
+)
+
+one_hot = OneHotEncoderTransform(
+    in_column="month", 
+    out_column="one_hot",
+)
+
+drop = FilterFeaturesTransform(exclude=["month"])
+
+preprocess = [scaler, lags, fourier_year, mean90, ..., d_flags, one_hot, drop]
+\end{lstlisting}
+
+Теперь формируем список преобразований/признаков с отбором признаков
+\begin{lstlisting}[
+style = ironpython,
+numbers = none	
+]
+forest = RandomForestRegressor(
+    max_depth=4,
+    n_estimators=10,
+    random_state=42,
+)
+\end{lstlisting}
+
+Теперь создаем экземпляр класса \verb|TreeFeatureSelectionTransform| для отбора признаков с помощью важностей признаков, вычисленных моделью случайного леса
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+forest_select = TreeFeatureSelectionTransform(top_k=20, model=forest)
+\end{lstlisting}
+
+
+
+
+
+
 
 
 
