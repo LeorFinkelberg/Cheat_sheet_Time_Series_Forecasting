@@ -2127,7 +2127,135 @@ style = ironpython,
 numbers = none
 ]
 forest_select = TreeFeatureSelectionTransform(top_k=20, model=forest)
+
+preprocess_select = preprocess + [forest_select]
 \end{lstlisting}
+
+\subsection{Кластеризация временных рядов}
+
+Библиотека ETNA позволяет выполнить кластеризацию временных рядов. Для объединения рядов в кластеры сначала нужно задать функцию расстояния между наблюдениями. Наиболее часто используемой мерой расстояния между наблюдениями рядов является евклидово расстояние и расстояние на основе динамической трансформации временной шкалы (dynamic time warping -- DTW).
+
+В библиотеке ETNA процедура вычисления расстояний реализована в классах \verb|EuclideanDistrance| и \verb|DTWDistance|, их можно вычислить для двух объектов \verb|pd.Series|, проиндексированных по временным меткам.
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+x1 = pd.Series(
+    data=[0, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+    index=pd.date_range("2020-01-01", periods=10)
+)
+
+x2 = pd.Series(
+    data=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    index=pd.date_range("2020-01-02", periods=10)
+)
+\end{lstlisting}
+
+Расчет расстояний в случае разных временных меток в классах \verb|EuclideanDistance| и \verb|DTWDistance| может выполняться в двух режимах:
+\begin{itemize}
+	\item \verb|trim_series=True| -- вычисляем расстояние только по общей, совпадающей части рядов (общая часть определяется по индексу временных меток), несовпадающие части рядов отсекаем (выполняется тримминг), отсюда и название параметра,
+	
+	\item \verb|trim_seires=False| -- вычисляем расстояние по всему ряду, игнорируя временные метки (эквивалентно отбрасыванию индекса временных меток и использованию индекса целочисленных значений, как в обычном массиве).
+\end{itemize}
+
+В библиотеке ETNA в классах \verb|EuclideanClustering| и \verb|DTWClustering| реализована иерархическая кластеризация.
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+from etna.clustering EuclideanClustering, DTWClustering
+
+model = EuclideanClustering()
+model.build_distance_matrix(ts=ts)
+\end{lstlisting}
+
+Пример иерархической кластеризации на основе DTW-расстояний
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+dtw_model = DTWClustering()
+# вычисляем матрицу DTW-расстояний
+dtw_model.build_distance_matrix(ts=ts)
+dtw_model.build_clustering_algo(n_clusters=3, linkage="average")
+
+segment2cluster = dtw_model.fit_predict()
+segment2cluster
+# output
+{
+    "market_1": 0,
+    "market_2": 2,
+    ...
+}
+\end{lstlisting}
+
+\subsection{Классификация временных рядов}
+
+Библиотека ETNA позволяет выполнить классификацию временных рядов. Каждое наблюдение -- это временной ряд. 
+
+Необработанные значения временных рядов обычно не являются лучшими признаками для классификатора. Длина ряда, как правило, намного больше, чем количество наблюдений в наборе данных, и в этом случае классификаторы работают плохо \cite[\strbook{592}]{gruzdev:time-series-2022}.
+
+Библиотека предлагает два способа извлечения признаков, способных работать с временными рядами различной длины. В первом способе используется класс \verb|TSFreshFeatureExtractor|, извлекающий признаки с помощью функции \verb|extract_featuers()| библиотеки tsfresh.
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+from tsfresh.feature_extractoin.settings import MinimalFCParameters
+from etna.experimental.classification.feature_extraction import TSFreshFeatureExtractor
+
+tsfresh_feature_extractor = TSFreshFeatureEXtractor(
+    default_fc_parameters=MinimalFCParameters(),
+    fill_na_value=-100,
+)
+\end{lstlisting}
+
+Во втором способе используется класс \verb|WEASELFeatureExtractor|, извлекающий признаки с помощью алгоритма WEASEL \url{https://arxiv.org/abs/1701.07681}. Алгоритм имеет большой список параметров, наиболее важными из которых являются:
+\begin{itemize}
+	\item \verb|padding_value| -- значение для заполнения ряда в тестовом наборе, так чтобы он соответствовал кратчайшему ряду в обучающем наборе,
+	
+	\item \verb|word_size|, \verb|n_bins| -- размер слова и размер алфавита для аппроксимации ряда (сильно влияет на качество),
+	
+	\item \verb|window_sizes| -- раземеры скользящих окон,
+	
+	\item \verb|window_steps| -- шаги окон,
+	
+	\item \verb|ch2_threshold| -- порог отбора признаков (чем выше порог, тем меньше признаков отбирается). 
+\end{itemize}
+
+\begin{lstlisting}[
+style = ironpython,
+numbers = none
+]
+from etna.experimental.classification import TimeSeriesBinaryClassifier
+from sklearn.linear_model import LogisticRegression
+from etna.experimental.classification.feature_extraction import WEASELFeatureExtractor
+
+weasel_feature_extractor = WEASELFeatureExtractor(
+    padding_value=-10,
+    word_size=4,
+    n_bins=4,
+    window_size=[0.2, 0.3, 0.5, 0.7, 0.9],
+    window_steps=[0.1, 0.15, 0.25, 0.35, 0.45],
+    chi2_threshold=2
+)
+
+model = LogisticRegression(max_iter=1000)
+clf = TimeSeriesBinaryClassifier(
+    feature_extractor=tsfresh_feature_extractor,
+    classifier=model,
+)
+
+mask = np.zeros(len(X_train))
+for fold_idx, (train_index, test_index) in enumerate(KFold(n_splits=5).split(X_train)):
+    mask[test_index] = fold_idx
+    
+metrics = clf.masked_crossval_score(
+    x=X_train,
+    y=y_train,
+    mask=mask,
+)
+\end{lstlisting}
+
 
 
 
